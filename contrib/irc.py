@@ -5,18 +5,20 @@
 __version__ = 0.9
 __author__ = "freddyb"
 
-from twisted.internet import protocol
+from twisted.internet import protocol, reactor
 from twisted.words.protocols import irc
 from itertools import cycle
 from types import MethodType
 from time import time # for channel timestamp
 import re # re.compile for stripping color-codes
+from textwrap import wrap
 
 DEFAULT_PORT = 6667
 DEFAULT_NICK = "pyhkal"
 DEFAULT_NAME = "PyHKAL 2.0"
 DEFAULT_PREFIX = "!"
 DEFAULT_ENCODINGS = ['utf-8', 'iso-8859-15']
+DEFAULT_QUEUE_DELAY = 0.753
 
 __settings__ = dict(
     irc = dict(
@@ -65,7 +67,10 @@ class IRCUser(Avatar): # TODO: Alle attribute als defer ermöglichen, falls wir 
     def message(self, text):
         dispatch_event("irc.sendnotice", self.nick, text)
 
-    def __str__(self):
+    def action(self, msg):
+        dispatch_event("irc.sendaction", self.nick, msg)
+
+    def __repr__(self):
         r=''
         if self.nick and self.ident and self.host:
             r += "%s!%s@%s" % (self.nick, self.ident, self.host)
@@ -88,6 +93,9 @@ class IRCChannel(Location):
             return user.nick in self.nicklist
         elif isinstance(user, basestring):
             return user in self.nicklist
+    def __iter__(self):
+        #XXX should return avatars
+        return iter(self.nicklist)
 
     def updateTopic(self, topic, nick, timestamp=None):
         self.topic = topic
@@ -110,6 +118,8 @@ class IRCChannel(Location):
 
     def message(self, msg):
         dispatch_event("irc.sendmessage", self.name, msg)
+    def action(self, msg):
+        dispatch_event("irc.sendaction", self.name, msg)
 
 class IRCMessage(Event):
     """Message transmitted via IRC protocol."""
@@ -123,13 +133,23 @@ class IRCQuery(Location):
 
 @hook("irc.sendmessage")
 def send_message(dst, msg):
-    # FIXME wrap around maximum length, is there something in twisted that will help us? ;)
-    dispatch_event("irc.send", "PRIVMSG %s :%s" % (dst, msg))
+    maxlen = 400
+    for line in wrap(msg, maxlen):
+        dispatch_event("irc.send", "PRIVMSG %s :%s" % (dst, line))
 
 @hook("irc.sendnotice")
 def send_notice(dst, msg):
-    # FIXME wrap around maximum length, is there something in twisted that will help us? ;)
-    dispatch_event("irc.send", "NOTICE %s :%s" % (dst, msg))
+    maxlen = 400
+    for line in wrap(msg, maxlen):
+        dispatch_event("irc.send", "NOTICE %s :%s" % (dst, line))
+
+@hook("irc.sendaction")
+def send_action(dst, msg):
+    dispatch_event("irc.sendctcp", dst, "ACTION "+msg)
+
+@hook("irc.sendctcp")
+def send_ctcp(dst, msg):
+    dispatch_event("irc.sendmessage", dst, "\x01%s\x01" % (msg))
 
 
 class IRCClient(irc.IRCClient, object):
@@ -153,6 +173,8 @@ class IRCClient(irc.IRCClient, object):
         self.whoamount = 0
         self.nickdb = {} # { 'ChosenOne' : <IRCUser Object>}, ... } 
         self.chandb = {} # { '#ich-sucke' : <IRCChannel Object>, ... }
+        self.lineRate = 0 # Enable queueing
+        self.lineCount = 0 # Amount of lines sent within the last N seconds
 
     def UpdateNickDB(self, resultlist):
         for user in resultlist:
@@ -166,9 +188,26 @@ class IRCClient(irc.IRCClient, object):
         irc.IRCClient.connectionMade(self)
         @hook("irc.send")
         def send(msg):
-            print "Sending %r" % (msg,)
+            self.lineCount += 1
+            if self.lineCount >= 3:
+                self.lineRate += 1
+            print "Sending %r" % (msg,) # not really, we're just enqueueing :)
             self.sendLine(msg)
         self._send = send
+
+    def _sendLine(self):
+        # irc.IRCClient._sendLine(self) + selfqueue stuff
+        if self._queue:
+             self._reallySendLine(self._queue.pop(0))
+             self._queueEmptying = reactor.callLater(self.lineRate,
+                                                     self._sendLine)
+        else:
+            self._queueEmptying = None
+            reactor.callLater(10, self.stopQueue)
+
+    def stopQueue(self):
+        self.lineCount = 0
+        self.lineRate = 0
 
     def kickedFrom(self, channel, kicker, message):
         irc.IRCClient.kickedFrom(self, channel, kicker, message)
