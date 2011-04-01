@@ -8,6 +8,7 @@ from twisted.internet import reactor
 def timer(event):
     args = event.content.split(" ", 1)
     if len(args) >= 2 and args[0].isdigit():
+        event.reply("Timer for %s started." % event.source.nick)
         reactor.callLater(int(args[0]), event.reply, u"Timer for %s: %s" % (event.source.nick, args[1]) )
     else:
         event.reply("timer <delay in seconds> <message>")
